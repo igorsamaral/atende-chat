@@ -40,7 +40,11 @@ app.use(routes);
 
 app.use(Sentry.Handlers.errorHandler());
 
-app.use(async (err: Error, req: Request, res: Response, _: NextFunction) => {
+app.use(async (err: Error, req: Request, res: Response, next: NextFunction) => {
+  // If headers already sent, delegate to the default Express error handler / next error middleware
+  if (res.headersSent) {
+    return next(err);
+  }
 
   if (err instanceof AppError) {
     logger.warn(err);

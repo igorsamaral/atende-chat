@@ -5,7 +5,8 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  makeInMemoryStore,
+  // makeInMemoryStore may not be exported in some versions / builds; import defensively
+  makeInMemoryStore as baileysMakeInMemoryStore,
   isJidBroadcast,
   CacheStore
 } from "@whiskeysockets/baileys";
@@ -87,9 +88,14 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
         let retriesQrCode = 0;
 
         let wsocket: Session = null;
-        const store = makeInMemoryStore({
-          logger: loggerBaileys
-        });
+        // support older/newer baileys distributions: if makeInMemoryStore is present use it,
+        // otherwise provide a minimal fallback in-memory store with a no-op bind to avoid runtime crash.
+        const store = (typeof (baileysMakeInMemoryStore as any) === "function")
+          ? (baileysMakeInMemoryStore as any)({ logger: loggerBaileys })
+          : {
+              // minimal fallback store used only to keep code paths that call `store.bind(ev)` safe
+              bind: (_ev: any) => { /* no-op fallback */ },
+            } as any;
 
         const { state, saveState } = await authState(whatsapp);
 
