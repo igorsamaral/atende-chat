@@ -146,6 +146,48 @@ export default async function authState(
     };
 
     keys = normalize(keys);
+    // Final sweep: ensure there are no plain objects that look like byte arrays remaining
+    let firstProblem: { path: string; value: any } | null = null
+    const sweep = (obj: any, path = "") => {
+      if (obj == null) return
+      if (typeof obj !== "object") return
+      if (obj instanceof Uint8Array || Buffer.isBuffer(obj)) return
+      if (Array.isArray(obj)) {
+        // arrays of numbers should be converted
+        if (obj.every((x) => typeof x === "number")) {
+          const buf = Uint8Array.from(obj)
+          return buf
+        }
+        for (let i = 0; i < obj.length; i++) obj[i] = sweep(obj[i], `${path}[${i}]`) || obj[i]
+        return obj
+      }
+      // object with numeric keys
+      const keysObj = Object.keys(obj)
+      if (
+        keysObj.length > 0 &&
+        keysObj.every((k) => /^\d+$/.test(k)) &&
+        keysObj.every((k) => typeof obj[k] === "number")
+      ) {
+        const arr = keysObj.map((k) => Number(k)).sort((a, b) => a - b).map((i) => obj[i])
+        return Uint8Array.from(arr)
+      }
+
+      // detect Buffer-like shapes { type: 'Buffer', data: ... }
+      if (obj.type === "Buffer" && obj.data) {
+        const d = obj.data
+        if (typeof d === "string") return Uint8Array.from(Buffer.from(d, "base64"))
+        if (Array.isArray(d)) return Uint8Array.from(d)
+      }
+
+      for (const k of keysObj) {
+        const res = sweep(obj[k], path ? `${path}.${k}` : k)
+        if (res) obj[k] = res
+      }
+      return null
+    }
+    // run sweep on creds and keys
+    sweep(creds, "creds")
+    sweep(keys, "keys")
   } else {
     creds = initAuthCreds()
     keys = {}
