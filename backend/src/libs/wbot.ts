@@ -28,8 +28,16 @@ type Session = WASocket & { id?: number; store?: Store };
 
 const sessions: Session[] = [];
 const retriesQrCodeMap = new Map<number, number>();
-const reconnectCooldown = new NodeCache({ stdTTL: 2, checkperiod: 2 }); // evita loop de reconexão
 
+// evita "tempestade" de reconexões no mesmo processo
+const reconnectCooldown = new NodeCache({ stdTTL: 2, checkperiod: 2 });
+
+// contador de backoff por instância (em memória do processo)
+const reconnectAttempts = new Map<number, number>();
+
+/**
+ * Extrai statusCode de um erro Boom/“cru”
+ */
 function getStatusCode(err: unknown): number | undefined {
   const boom = err as Boom | undefined;
   if (boom && (boom as any)?.isBoom && boom.output?.statusCode) {
@@ -39,6 +47,9 @@ function getStatusCode(err: unknown): number | undefined {
   return anyErr?.output?.statusCode ?? anyErr?.statusCode ?? anyErr?.code;
 }
 
+/**
+ * Erros transitórios típicos de rede/stream (reconectar mantendo auth)
+ */
 function isTransient(status?: number) {
   return (
     status === DisconnectReason.connectionClosed ||
@@ -49,14 +60,79 @@ function isTransient(status?: number) {
   );
 }
 
+/**
+ * Lock “distribuído” simples usando o próprio model Whatsapp.status
+ * Marca CONNECTING por até 20s; se outro processo já estiver conectando/conectado, não inicia outra sessão.
+ */
+async function acquireSessionLock(whatsapp: Whatsapp): Promise<boolean> {
+  const fresh = await Whatsapp.findOne({ where: { id: whatsapp.id } });
+  if (!fresh) return false;
+
+  const now = Date.now();
+  const updatedAt = (fresh as any).updatedAt ? new Date((fresh as any).updatedAt).getTime() : 0;
+  const ageMs = now - updatedAt;
+
+  const status: string = (fresh as any).status || "";
+
+  // se já está CONNECTED, não tentar
+  if (status === "CONNECTED") return false;
+
+  // se está CONNECTING “recente”, respeitar lock
+  if (status === "CONNECTING" && ageMs < 20000) return false;
+
+  try {
+    await fresh.update({ status: "CONNECTING" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseSessionLock(whatsapp: Whatsapp, nextStatus: string = "DISCONNECTED") {
+  try {
+    const fresh = await Whatsapp.findOne({ where: { id: whatsapp.id } });
+    if (!fresh) return;
+    // só atualiza se ainda estiver marcado como CONNECTING (evita sobreescrever CONNECTED)
+    if ((fresh as any).status === "CONNECTING") {
+      await fresh.update({ status: nextStatus });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Reinicia a sessão com cooldown + jitter e com lock via DB
+ */
 async function safeRestart(whatsapp: Whatsapp) {
   const key = `re:${whatsapp.id}`;
   if (reconnectCooldown.get(key)) return;
+
   reconnectCooldown.set(key, true);
-  const base = 1200; // 1.2s
-  const jitter = Math.floor(Math.random() * 800); // 0-800ms
-  await new Promise((r) => setTimeout(r, base + jitter));
-  StartWhatsAppSession(whatsapp, whatsapp.companyId);
+  const tries = (reconnectAttempts.get(whatsapp.id) || 0) + 1;
+  reconnectAttempts.set(whatsapp.id, tries);
+
+  // backoff exponencial com teto (1.2s * 2^n; máx. 15s) + jitter 0-800ms
+  const base = 1200 * Math.pow(2, Math.min(tries - 1, 3)); // 1.2s, 2.4s, 4.8s, 9.6s...
+  const delay = Math.min(15000, base);
+  const jitter = Math.floor(Math.random() * 800);
+  await new Promise((r) => setTimeout(r, delay + jitter));
+
+  // tenta adquirir lock
+  const gotLock = await acquireSessionLock(whatsapp);
+  if (!gotLock) {
+    logger.warn(`[WA:${whatsapp.id}] lock not acquired, skipping restart`);
+    return;
+  }
+
+  try {
+    logger.info(`[WA:${whatsapp.id}] restarting session... (attempt ${tries})`);
+    StartWhatsAppSession(whatsapp, whatsapp.companyId);
+  } catch (e) {
+    logger.error(`[WA:${whatsapp.id}] restart error`, e);
+    // libera lock para permitir outra tentativa futura
+    await releaseSessionLock(whatsapp, "DISCONNECTED");
+  }
 }
 
 export const getWbot = (whatsappId: number): Session => {
@@ -104,7 +180,7 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
       const { state, saveState } = await authState(whatsapp);
 
       const msgRetryCounterCache = new NodeCache();
-      const userDevicesCache: CacheStore = new NodeCache(); // (ainda não usado aqui)
+      const userDevicesCache: CacheStore = new NodeCache(); // reservado para features futuras
 
       wsocket = makeWASocket({
         logger: loggerBaileys,
@@ -116,71 +192,89 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
         shouldIgnoreJid: (jid) => isJidBroadcast(jid),
       }) as Session;
 
+      // zera tentativas (voltou a montar socket)
+      reconnectAttempts.set(whatsapp.id, 0);
+
       wsocket.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
         logger.info(`Socket ${name} Connection Update ${connection || ""} ${lastDisconnect || ""}`);
 
         if (connection === "close") {
-          const code = getStatusCode(lastDisconnect?.error);
+          const err = lastDisconnect?.error as any;
+          const code = getStatusCode(err);
+          logger.warn(`[${name}] close status=${code} details=${err?.message || ""}`);
 
-          // encerra socket/listeners antigos pra evitar vazamento/duplicação
-          try { wsocket?.ev.removeAllListeners("connection.update"); } catch (_) { }
-          try { (wsocket as any)?.end?.(); } catch (_) { }
-          try { wsocket?.ws?.close(); } catch (_) { }
+          // encerra listeners/socket antigos (evita duplicação)
+          try { wsocket?.ev.removeAllListeners("connection.update"); } catch {}
+          try { (wsocket as any)?.end?.(); } catch {}
+          try { wsocket?.ws?.close(); } catch {}
 
+          // logged out → precisa re-parear
           if (code === 403 || code === DisconnectReason.loggedOut || code === 401) {
-            // precisa novo pareamento
             await whatsappUpdate.update({ status: "PENDING", session: "" });
             await DeleteBaileysService(whatsapp.id);
+
             io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
               `company-${whatsapp.companyId}-whatsappSession`,
               { action: "update", session: whatsappUpdate }
             );
-            removeWbot(id, false);
+
+            await removeWbot(id, false);
             await safeRestart(whatsapp);
             return;
           }
 
+          // falha transitória (rede/stream)
           if (isTransient(code)) {
-            // reconecta reaproveitando authState
-            removeWbot(id, false);
+            await removeWbot(id, false);
             await safeRestart(whatsapp);
             return;
           }
 
           // fallback: trata como transitório
-          removeWbot(id, false);
+          await removeWbot(id, false);
           await safeRestart(whatsapp);
         }
 
         if (connection === "open") {
+          // conexão OK — marca conectado e libera o "lock"
           await whatsappUpdate.update({ status: "CONNECTED", qrcode: "", retries: 0 });
           io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
             `company-${whatsapp.companyId}-whatsappSession`,
             { action: "update", session: whatsappUpdate }
           );
+
           const sessionIndex = sessions.findIndex((s) => s.id === whatsapp.id);
           if (sessionIndex === -1) { wsocket!.id = whatsapp.id; sessions.push(wsocket!); }
+
+          // libera lock se ainda marcado
+          await releaseSessionLock(whatsapp, "CONNECTED");
+
           resolve(wsocket!);
         }
 
         if (qr !== undefined) {
+          // controla spam de QR
           if (retriesQrCodeMap.get(id) && retriesQrCodeMap.get(id)! >= 3) {
             await whatsappUpdate.update({ status: "DISCONNECTED", qrcode: "" });
             await DeleteBaileysService(whatsappUpdate.id);
+
             io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
               "whatsappSession",
               { action: "update", session: whatsappUpdate }
             );
-            try { wsocket!.ev.removeAllListeners("connection.update"); } catch (_) { }
-            try { (wsocket as any)?.end?.(); } catch (_) { }
-            try { wsocket!.ws.close(); } catch (_) { }
+
+            try { wsocket!.ev.removeAllListeners("connection.update"); } catch {}
+            try { (wsocket as any)?.end?.(); } catch {}
+            try { wsocket!.ws.close(); } catch {}
             wsocket = null;
             retriesQrCodeMap.delete(id);
           } else {
             retriesQrCodeMap.set(id, (retriesQrCode += 1));
             await whatsappUpdate.update({ qrcode: qr, status: "qrcode", retries: 0 });
+
             const sessionIndex = sessions.findIndex((s) => s.id === whatsapp.id);
             if (sessionIndex === -1) { wsocket!.id = whatsapp.id; sessions.push(wsocket!); }
+
             io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
               `company-${whatsapp.companyId}-whatsappSession`,
               { action: "update", session: whatsappUpdate }
