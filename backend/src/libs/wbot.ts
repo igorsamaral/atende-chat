@@ -309,6 +309,5 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
         } catch (e) {
           logger.error(e);
         }
-
-  return sock
-}
+      });
+  };
