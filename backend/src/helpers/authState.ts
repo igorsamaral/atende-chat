@@ -98,6 +98,54 @@ export default async function authState(
     const parsed = JSON.parse(whatsapp.session, BufferJSON.reviver)
     creds = normalizeCreds(toBufferDeep(parsed.creds)) // <- normaliza campos críticos
     keys = parsed.keys || {}
+    // Normalize any buffer-like shapes in keys to actual Uint8Array instances
+    const normalize = (val: any): any => {
+      if (!val || typeof val !== "object") return val;
+      // already a typed array
+      if (val instanceof Uint8Array) return val;
+
+      // arrays of numbers -> Uint8Array
+      if (Array.isArray(val) && val.every((x) => typeof x === "number")) {
+        return Uint8Array.from(val);
+      }
+
+      // { type: 'Buffer', data: ... }
+      if (val.type === "Buffer") {
+        const d = val.data;
+        if (typeof d === "string") return Uint8Array.from(Buffer.from(d, "base64"));
+        if (Array.isArray(d)) return Uint8Array.from(d);
+        if (d && typeof d === "object") {
+          const arr = Object.keys(d)
+            .map((k) => Number(k))
+            .filter((k) => !Number.isNaN(k))
+            .sort((a, b) => a - b)
+            .map((i) => d[i]);
+          return Uint8Array.from(arr);
+        }
+      }
+
+      // object with numeric keys -> treat as array-like
+      const keysObj = Object.keys(val);
+      if (
+        keysObj.length > 0 &&
+        keysObj.every((k) => /^\d+$/.test(k)) &&
+        keysObj.every((k) => typeof val[k] === "number")
+      ) {
+        const arr = keysObj
+          .map((k) => Number(k))
+          .sort((a, b) => a - b)
+          .map((i) => val[i]);
+        return Uint8Array.from(arr);
+      }
+
+      // otherwise recursively normalize properties
+      for (const k of Object.keys(val)) {
+        val[k] = normalize(val[k]);
+      }
+      return val;
+    };
+
+    keys = normalize(keys);
   } else {
     creds = initAuthCreds()
     keys = {}
