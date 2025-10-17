@@ -106,21 +106,21 @@ export default async function authState(
 
       // arrays of numbers -> Uint8Array
       if (Array.isArray(val) && val.every((x) => typeof x === "number")) {
-        return Uint8Array.from(val);
+        return Buffer.from(val);
       }
 
       // { type: 'Buffer', data: ... }
       if (val.type === "Buffer") {
         const d = val.data;
-        if (typeof d === "string") return Uint8Array.from(Buffer.from(d, "base64"));
-        if (Array.isArray(d)) return Uint8Array.from(d);
+        if (typeof d === "string") return Buffer.from(d, "base64");
+        if (Array.isArray(d)) return Buffer.from(d);
         if (d && typeof d === "object") {
           const arr = Object.keys(d)
             .map((k) => Number(k))
             .filter((k) => !Number.isNaN(k))
             .sort((a, b) => a - b)
             .map((i) => d[i]);
-          return Uint8Array.from(arr);
+          return Buffer.from(arr);
         }
       }
 
@@ -135,7 +135,7 @@ export default async function authState(
           .map((k) => Number(k))
           .sort((a, b) => a - b)
           .map((i) => val[i]);
-        return Uint8Array.from(arr);
+        return Buffer.from(arr);
       }
 
       // otherwise recursively normalize properties
