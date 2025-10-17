@@ -3,10 +3,11 @@ import type { AuthenticationCreds, AuthenticationState } from "@whiskeysockets/b
 import { initAuthCreds, makeCacheableSignalKeyStore } from "@whiskeysockets/baileys"
 import Whatsapp from "../models/Whatsapp"
 
-// ---- utils: Buffer everywhere ----
+// ---------- utils: garantir Buffer em todos os campos binários ----------
 const toBuffer = (v: any): any => {
   if (Buffer.isBuffer(v)) return v
   if (v instanceof Uint8Array) return Buffer.from(v)
+  if (typeof v === "string") return Buffer.from(v, "base64")
   if (v && typeof v === "object" && v.type === "Buffer" && typeof v.data === "string") {
     return Buffer.from(v.data, "base64")
   }
@@ -29,7 +30,30 @@ const toBufferDeep = (v: any): any => {
   return v
 }
 
-// JSON helpers: salva buffers como base64; lê de volta como Buffer
+// normaliza especificamente as creds usadas no Noise/Signal
+const normalizeCreds = (c: any) => {
+  if (!c) return c
+  if (c.advSecretKey) c.advSecretKey = toBuffer(c.advSecretKey)
+  if (c.noiseKey) {
+    if (c.noiseKey.private) c.noiseKey.private = toBuffer(c.noiseKey.private)
+    if (c.noiseKey.public) c.noiseKey.public = toBuffer(c.noiseKey.public)
+  }
+  if (c.signedIdentityKey) {
+    if (c.signedIdentityKey.private) c.signedIdentityKey.private = toBuffer(c.signedIdentityKey.private)
+    if (c.signedIdentityKey.public) c.signedIdentityKey.public = toBuffer(c.signedIdentityKey.public)
+  }
+  if (c.signedPreKey) {
+    if (c.signedPreKey.signature) c.signedPreKey.signature = toBuffer(c.signedPreKey.signature)
+    if (c.signedPreKey.keyPair) {
+      if (c.signedPreKey.keyPair.private) c.signedPreKey.keyPair.private = toBuffer(c.signedPreKey.keyPair.private)
+      if (c.signedPreKey.keyPair.public) c.signedPreKey.keyPair.public = toBuffer(c.signedPreKey.keyPair.public)
+    }
+  }
+  if (c.account?.signatureKey?.public) c.account.signatureKey.public = toBuffer(c.account.signatureKey.public)
+  return c
+}
+
+// JSON helpers: salva Buffer/Uint8Array como base64; lê de volta como Buffer
 const BufferJSON = {
   replacer: (_k: string, value: any) => {
     if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
@@ -49,8 +73,8 @@ const KEY_MAP: Record<string, string> = {
   "pre-key": "preKeys",
   session: "sessions",
   "sender-key": "senderKeys",
-  "app-state-sync-key": "appStateSyncKeys",      // mantemos cru
-  "app-state-sync-version": "appStateVersions",  // mantemos cru
+  "app-state-sync-key": "appStateSyncKeys",      // manter cru
+  "app-state-sync-version": "appStateVersions",  // manter cru
   "sender-key-memory": "senderKeyMemory"
 }
 
@@ -72,7 +96,7 @@ export default async function authState(
 
   if (whatsapp.session) {
     const parsed = JSON.parse(whatsapp.session, BufferJSON.reviver)
-    creds = toBufferDeep(parsed.creds)
+    creds = normalizeCreds(toBufferDeep(parsed.creds)) // <- normaliza campos críticos
     keys = parsed.keys || {}
   } else {
     creds = initAuthCreds()
@@ -88,7 +112,7 @@ export default async function authState(
           dict[id] =
             type === "app-state-sync-key" || type === "app-state-sync-version"
               ? v
-              : toBufferDeep(v)
+              : toBufferDeep(v) // garantir Buffer
         }
         return dict
       }, {})
@@ -99,8 +123,8 @@ export default async function authState(
         keys[bag] = keys[bag] || {}
         const payload =
           t === "app-state-sync-key" || t === "app-state-sync-version"
-            ? data[t]
-            : toBufferDeep(data[t])
+            ? data[t]            // manter cru
+            : toBufferDeep(data[t]) // normalizar p/ Buffer
         Object.assign(keys[bag], payload)
       }
       void saveState()
@@ -110,7 +134,7 @@ export default async function authState(
   return {
     state: {
       creds: toBufferDeep(creds),
-      keys: makeCacheableSignalKeyStore(rawKeyStore as any)
+      keys: makeCacheableSignalKeyStore(rawKeyStore as any) // wrapper oficial
     },
     saveState
   }
