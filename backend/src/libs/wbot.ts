@@ -22,7 +22,6 @@ import { Store } from "./store";
 import { StartWhatsAppSession } from "../services/WbotServices/StartWhatsAppSession";
 import DeleteBaileysService from "../services/BaileysServices/DeleteBaileysService";
 import NodeCache from "node-cache";
-import authState from "../helpers/authState";
 
 const loggerBaileys = MAIN_LOGGER.child({});
 loggerBaileys.level = "error";
