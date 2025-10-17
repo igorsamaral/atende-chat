@@ -15,8 +15,24 @@ const BufferJSON = {
     return value;
   },
   reviver: (_k: string, value: any) => {
-    if (value && value.type === "Buffer" && typeof value.data === "string") {
-      return Uint8Array.from(Buffer.from(value.data, "base64"));
+    if (value && value.type === "Buffer") {
+      // handle base64 string ("data": "...base64...")
+      if (typeof value.data === "string") {
+        return Uint8Array.from(Buffer.from(value.data, "base64"));
+      }
+      // handle array of numbers ([1,2,3]) or object with numeric indices
+      if (Array.isArray(value.data)) {
+        return Uint8Array.from(value.data);
+      }
+      if (value.data && typeof value.data === "object") {
+        // convert { '0':1,'1':2 } to Uint8Array
+        const arr = Object.keys(value.data)
+          .map(k => Number(k))
+          .filter(k => !Number.isNaN(k))
+          .sort((a, b) => a - b)
+          .map(i => value.data[i]);
+        return Uint8Array.from(arr);
+      }
     }
     return value;
   }
