@@ -1,43 +1,37 @@
-import type {
-  AuthenticationCreds,
-  AuthenticationState
-} from "@whiskeysockets/baileys";
-// import runtime helpers directly from the package so we get runtime values
+import type { AuthenticationCreds, AuthenticationState } from "@whiskeysockets/baileys";
 import { initAuthCreds } from "@whiskeysockets/baileys/lib/Utils/auth-utils.js";
-import * as proto from "@whiskeysockets/baileys/WAProto/index.js";
+import { makeCacheableSignalKeyStore } from "@whiskeysockets/baileys"; // 👈 IMPORTANTE
+// import * as proto from "@whiskeysockets/baileys/WAProto/index.js"; // não é necessário aqui
 
-// local BufferJSON replacer/reviver to persist binary fields (Uint8Array) as base64
+import Whatsapp from "../models/Whatsapp";
+
+// helper: converte recursivamente Uint8Array -> Buffer
+const toBufferDeep = (val: any): any => {
+  if (val instanceof Uint8Array) return Buffer.from(val);
+  if (Array.isArray(val)) return val.map(toBufferDeep);
+  if (val && typeof val === "object") {
+    const out: any = Array.isArray(val) ? [] : {};
+    for (const k of Object.keys(val)) out[k] = toBufferDeep(val[k]);
+    return out;
+  }
+  return val;
+};
+
+// BufferJSON agora decodifica como Buffer (não Uint8Array)
 const BufferJSON = {
   replacer: (_k: string, value: any) => {
-    if (value instanceof Uint8Array) {
+    if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
       return { type: "Buffer", data: Buffer.from(value).toString("base64") };
     }
     return value;
   },
   reviver: (_k: string, value: any) => {
-    if (value && value.type === "Buffer") {
-      // handle base64 string ("data": "...base64...")
-      if (typeof value.data === "string") {
-        return Uint8Array.from(Buffer.from(value.data, "base64"));
-      }
-      // handle array of numbers ([1,2,3]) or object with numeric indices
-      if (Array.isArray(value.data)) {
-        return Uint8Array.from(value.data);
-      }
-      if (value.data && typeof value.data === "object") {
-        // convert { '0':1,'1':2 } to Uint8Array
-        const arr = Object.keys(value.data)
-          .map(k => Number(k))
-          .filter(k => !Number.isNaN(k))
-          .sort((a, b) => a - b)
-          .map(i => value.data[i]);
-        return Uint8Array.from(arr);
-      }
+    if (value && value.type === "Buffer" && typeof value.data === "string") {
+      return Buffer.from(value.data, "base64"); // 👈 volta como Buffer
     }
     return value;
   }
 };
-import Whatsapp from "../models/Whatsapp";
 
 const KEY_MAP: Record<string, string> = {
   "pre-key": "preKeys",
@@ -56,6 +50,7 @@ const authState = async (
 
   const saveState = async () => {
     try {
+      // salva já normalizado para base64 (via BufferJSON)
       await whatsapp.update({
         session: JSON.stringify({ creds, keys }, BufferJSON.replacer, 0)
       });
@@ -64,47 +59,45 @@ const authState = async (
     }
   };
 
-  // const getSessionDatabase = await whatsappById(whatsapp.id);
-
-  if (whatsapp.session && whatsapp.session !== null) {
-    const result = JSON.parse(whatsapp.session, BufferJSON.reviver);
-    creds = result.creds;
-    keys = result.keys;
+  if (whatsapp.session) {
+    // carrega e garante Buffer em todo lugar
+    const parsed = JSON.parse(whatsapp.session, BufferJSON.reviver);
+    creds = toBufferDeep(parsed.creds);
+    keys = toBufferDeep(parsed.keys);
   } else {
-    creds = initAuthCreds();
+    creds = initAuthCreds(); // já no formato esperado pela versão atual
     keys = {};
   }
 
+  // keystore cru em memória (convertendo outputs para Buffer)
+  const rawKeyStore = {
+    get: (type: string, ids: string[]) => {
+      const key = KEY_MAP[type];
+      return ids.reduce((dict: any, id: string) => {
+        const v = keys[key]?.[id];
+        if (v !== undefined) {
+          dict[id] = toBufferDeep(v); // 👈 garante Buffer nas chaves
+        }
+        return dict;
+      }, {});
+    },
+    set: (data: any) => {
+      for (const type of Object.keys(data)) {
+        const key = KEY_MAP[type];
+        keys[key] = keys[key] || {};
+        // normaliza para Buffer ao salvar em memória
+        const payload = toBufferDeep(data[type]);
+        Object.assign(keys[key], payload);
+      }
+      void saveState();
+    }
+  };
+
   return {
     state: {
-      creds,
-      keys: {
-        get: (type, ids) => {
-          const key = KEY_MAP[type];
-          return ids.reduce((dict: any, id) => {
-            let value = keys[key]?.[id];
-            if (value) {
-              if (type === "app-state-sync-key") {
-                // keep raw object for app-state-sync-key (runtime proto class not required)
-                // previous versions converted to a proto class, but the plain object is sufficient
-                // for storage and later usage by the library.
-                value = value;
-              }
-              dict[id] = value;
-            }
-            return dict;
-          }, {});
-        },
-        set: (data: any) => {
-          // eslint-disable-next-line no-restricted-syntax, guard-for-in
-          for (const i in data) {
-            const key = KEY_MAP[i];
-            keys[key] = keys[key] || {};
-            Object.assign(keys[key], data[i]);
-          }
-          saveState();
-        }
-      }
+      creds: toBufferDeep(creds), // 👈 por garantia (noiseKey, signedIdentityKey, etc.)
+      // ESSENCIAL: envolver com makeCacheableSignalKeyStore
+      keys: makeCacheableSignalKeyStore(rawKeyStore as any)
     },
     saveState
   };
