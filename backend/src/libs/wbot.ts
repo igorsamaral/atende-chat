@@ -28,6 +28,36 @@ type Session = WASocket & { id?: number; store?: Store };
 
 const sessions: Session[] = [];
 const retriesQrCodeMap = new Map<number, number>();
+const reconnectCooldown = new NodeCache({ stdTTL: 2, checkperiod: 2 }); // evita loop de reconexão
+
+function getStatusCode(err: unknown): number | undefined {
+  const boom = err as Boom | undefined;
+  if (boom && (boom as any)?.isBoom && boom.output?.statusCode) {
+    return boom.output.statusCode;
+  }
+  const anyErr = err as any;
+  return anyErr?.output?.statusCode ?? anyErr?.statusCode ?? anyErr?.code;
+}
+
+function isTransient(status?: number) {
+  return (
+    status === DisconnectReason.connectionClosed ||
+    status === DisconnectReason.connectionLost ||
+    status === 503 ||
+    status === 515 ||
+    typeof status === "undefined"
+  );
+}
+
+async function safeRestart(whatsapp: Whatsapp) {
+  const key = `re:${whatsapp.id}`;
+  if (reconnectCooldown.get(key)) return;
+  reconnectCooldown.set(key, true);
+  const base = 1200; // 1.2s
+  const jitter = Math.floor(Math.random() * 800); // 0-800ms
+  await new Promise((r) => setTimeout(r, base + jitter));
+  StartWhatsAppSession(whatsapp, whatsapp.companyId);
+}
 
 export const getWbot = (whatsappId: number): Session => {
   const sessionIndex = sessions.findIndex((s) => s.id === whatsappId);
@@ -74,7 +104,7 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
       const { state, saveState } = await authState(whatsapp);
 
       const msgRetryCounterCache = new NodeCache();
-      const userDevicesCache: CacheStore = new NodeCache();
+      const userDevicesCache: CacheStore = new NodeCache(); // (ainda não usado aqui)
 
       wsocket = makeWASocket({
         logger: loggerBaileys,
@@ -90,22 +120,44 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
         logger.info(`Socket ${name} Connection Update ${connection || ""} ${lastDisconnect || ""}`);
 
         if (connection === "close") {
-          const code = (lastDisconnect?.error as Boom)?.output?.statusCode || (lastDisconnect?.error as any)?.code;
-          if (code === 403 || code === DisconnectReason.loggedOut) {
+          const code = getStatusCode(lastDisconnect?.error);
+
+          // encerra socket/listeners antigos pra evitar vazamento/duplicação
+          try { wsocket?.ev.removeAllListeners("connection.update"); } catch (_) { }
+          try { (wsocket as any)?.end?.(); } catch (_) { }
+          try { wsocket?.ws?.close(); } catch (_) { }
+
+          if (code === 403 || code === DisconnectReason.loggedOut || code === 401) {
+            // precisa novo pareamento
             await whatsappUpdate.update({ status: "PENDING", session: "" });
             await DeleteBaileysService(whatsapp.id);
-            getIO().to(`company-${whatsapp.companyId}-mainchannel`).emit(`company-${whatsapp.companyId}-whatsappSession`, { action: "update", session: whatsappUpdate });
+            io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
+              `company-${whatsapp.companyId}-whatsappSession`,
+              { action: "update", session: whatsappUpdate }
+            );
             removeWbot(id, false);
-            setTimeout(() => StartWhatsAppSession(whatsapp, whatsapp.companyId), 2000);
-          } else {
-            removeWbot(id, false);
-            setTimeout(() => StartWhatsAppSession(whatsapp, whatsapp.companyId), 2000);
+            await safeRestart(whatsapp);
+            return;
           }
+
+          if (isTransient(code)) {
+            // reconecta reaproveitando authState
+            removeWbot(id, false);
+            await safeRestart(whatsapp);
+            return;
+          }
+
+          // fallback: trata como transitório
+          removeWbot(id, false);
+          await safeRestart(whatsapp);
         }
 
         if (connection === "open") {
           await whatsappUpdate.update({ status: "CONNECTED", qrcode: "", retries: 0 });
-          io.to(`company-${whatsapp.companyId}-mainchannel`).emit(`company-${whatsapp.companyId}-whatsappSession`, { action: "update", session: whatsappUpdate });
+          io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
+            `company-${whatsapp.companyId}-whatsappSession`,
+            { action: "update", session: whatsappUpdate }
+          );
           const sessionIndex = sessions.findIndex((s) => s.id === whatsapp.id);
           if (sessionIndex === -1) { wsocket!.id = whatsapp.id; sessions.push(wsocket!); }
           resolve(wsocket!);
@@ -115,9 +167,13 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
           if (retriesQrCodeMap.get(id) && retriesQrCodeMap.get(id)! >= 3) {
             await whatsappUpdate.update({ status: "DISCONNECTED", qrcode: "" });
             await DeleteBaileysService(whatsappUpdate.id);
-            io.to(`company-${whatsapp.companyId}-mainchannel`).emit("whatsappSession", { action: "update", session: whatsappUpdate });
-            wsocket!.ev.removeAllListeners("connection.update");
-            try { wsocket!.ws.close(); } catch (_) { /* ignore */ }
+            io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
+              "whatsappSession",
+              { action: "update", session: whatsappUpdate }
+            );
+            try { wsocket!.ev.removeAllListeners("connection.update"); } catch (_) { }
+            try { (wsocket as any)?.end?.(); } catch (_) { }
+            try { wsocket!.ws.close(); } catch (_) { }
             wsocket = null;
             retriesQrCodeMap.delete(id);
           } else {
@@ -125,7 +181,10 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
             await whatsappUpdate.update({ qrcode: qr, status: "qrcode", retries: 0 });
             const sessionIndex = sessions.findIndex((s) => s.id === whatsapp.id);
             if (sessionIndex === -1) { wsocket!.id = whatsapp.id; sessions.push(wsocket!); }
-            io.to(`company-${whatsapp.companyId}-mainchannel`).emit(`company-${whatsapp.companyId}-whatsappSession`, { action: "update", session: whatsappUpdate });
+            io.to(`company-${whatsapp.companyId}-mainchannel`).emit(
+              `company-${whatsapp.companyId}-whatsappSession`,
+              { action: "update", session: whatsappUpdate }
+            );
           }
         }
       });
