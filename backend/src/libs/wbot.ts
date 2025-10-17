@@ -131,6 +131,24 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
             state.creds = coerceToBufferDeep(state.creds);
             state.keys = coerceToBufferDeep(state.keys);
 
+            // Additional normalization: JSON round-trip to ensure any remaining
+            // Buffer-like plain objects become actual Buffer instances.
+            const replacer = (_k: string, v: any) => {
+              if (v == null) return v;
+              if (Buffer.isBuffer(v) || v instanceof Uint8Array) return { type: "Buffer", data: Buffer.from(v).toString("base64") };
+              return v;
+            };
+            const reviver = (_k: string, v: any) => {
+              if (v && v.type === "Buffer" && typeof v.data === "string") return Buffer.from(v.data, "base64");
+              return v;
+            };
+            try {
+              state.creds = JSON.parse(JSON.stringify(state.creds, replacer), reviver);
+              state.keys = JSON.parse(JSON.stringify(state.keys, replacer), reviver);
+            } catch (_e) {
+              // if roundtrip fails, ignore — we already did best-effort coercion
+            }
+
             if (process.env.DEBUG_AUTH === "true") {
               /* eslint-disable no-console */
               const sample = {
@@ -238,42 +256,59 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
     } catch (error) {
       Sentry.captureException(error);
       console.log(error);
-      reject(error);
-    }
-  });
-};
+        try {
+          if (state?.creds) {
+            // Final coercion for critical credential fields
+            const coerceField = (v: any) => {
+              if (v == null) return v;
+              if (Buffer.isBuffer(v)) return v;
+              if (v instanceof Uint8Array) return Buffer.from(v);
+              if (typeof v === 'string') return Buffer.from(v, 'base64');
+              // { type: 'Buffer', data: ... }
+              if (v && typeof v === 'object' && v.type === 'Buffer') {
+                if (typeof v.data === 'string') return Buffer.from(v.data, 'base64');
+                if (Array.isArray(v.data)) return Buffer.from(v.data);
+              }
+              // array-like object {'0':..,'1':..}
+              if (v && typeof v === 'object') {
+                const keys = Object.keys(v);
+                if (keys.length && keys.every(k => /^\d+$/.test(k) && typeof v[k] === 'number')) {
+                  const arr = keys.map(k => Number(k)).sort((a,b)=>a-b).map(i => v[i]);
+                  return Buffer.from(arr);
+                }
+              }
+              return v;
+            };
 
-export async function startWbot({ whatsapp }: StartOpts) {
-  const { version, isLatest } = await fetchLatestBaileysVersion()
-  logger.info({ version, isLatest }, "Using WA version")
+            const creds = state.creds;
+            try {
+              creds.noiseKey && (creds.noiseKey.private = coerceField(creds.noiseKey.private));
+              creds.noiseKey && (creds.noiseKey.public = coerceField(creds.noiseKey.public));
+              creds.signedIdentityKey && (creds.signedIdentityKey.private = coerceField(creds.signedIdentityKey.private));
+              creds.signedIdentityKey && (creds.signedIdentityKey.public = coerceField(creds.signedIdentityKey.public));
+              creds.signedPreKey && (creds.signedPreKey.signature = coerceField(creds.signedPreKey.signature));
+              creds.signedPreKey && creds.signedPreKey.keyPair && (creds.signedPreKey.keyPair.private = coerceField(creds.signedPreKey.keyPair.private));
+              creds.signedPreKey && creds.signedPreKey.keyPair && (creds.signedPreKey.keyPair.public = coerceField(creds.signedPreKey.keyPair.public));
+            } catch (er) {
+              logger.error('error coercing creds fields', er);
+            }
 
-  const { state, saveState } = await authState(whatsapp)
-
-  const sock = makeWASocket({
-    version,
-    logger: loggerBaileys,
-    browser: Browsers("Atendechat", "Chrome", "1.0.0"),
-    printQRInTerminal: false,
-    auth: state,                 // <- idem aqui
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    emitOwnEvents: false,
-    defaultQueryTimeoutMs: 60_000
-  })
-
-  sock.ev.on("creds.update", saveState)
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update
-    if (qr) logger.info("QR code gerado (envie para o front)")
-    if (connection === "close") {
-      const code =
-        (lastDisconnect?.error as any)?.output?.statusCode ||
-        (lastDisconnect?.error as any)?.code
-      logger.error({ code, err: lastDisconnect?.error }, "Conexão fechada")
-      if (code === DisconnectReason.loggedOut) void whatsapp.update({ session: null })
-    }
-    if (connection === "open") logger.info("Conectado ao WhatsApp ✅")
-  })
+            // small diagnostics (no secrets): show which fields are buffers
+            try {
+              const diag = {
+                noiseKeyPrivate: !!(state.creds?.noiseKey?.private && (Buffer.isBuffer(state.creds.noiseKey.private) || state.creds.noiseKey.private instanceof Uint8Array)),
+                noiseKeyPublic: !!(state.creds?.noiseKey?.public && (Buffer.isBuffer(state.creds.noiseKey.public) || state.creds.noiseKey.public instanceof Uint8Array)),
+                signedIdentityKeyPrivate: !!(state.creds?.signedIdentityKey?.private && (Buffer.isBuffer(state.creds.signedIdentityKey.private) || state.creds.signedIdentityKey.private instanceof Uint8Array)),
+                signedPreKeySignature: !!(state.creds?.signedPreKey?.signature && (Buffer.isBuffer(state.creds.signedPreKey.signature) || state.creds.signedPreKey.signature instanceof Uint8Array))
+              };
+              logger.info({ diag }, 'auth creds diagnostics');
+            } catch (er) {
+              // ignore diag errors
+            }
+          }
+        } catch (e) {
+          logger.error(e);
+        }
 
   return sock
 }
