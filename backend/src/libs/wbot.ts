@@ -274,7 +274,6 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
 
 
 export async function startWbot({ whatsapp }: StartOpts) {
-  const logger = pino({ level: "info" })
   const { version, isLatest } = await fetchLatestBaileysVersion()
   logger.info({ version, isLatest }, "Using WA version")
 
