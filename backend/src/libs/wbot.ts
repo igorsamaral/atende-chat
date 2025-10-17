@@ -14,7 +14,7 @@ import makeWASocket, {
 import Whatsapp from "../models/Whatsapp";
 import { logger } from "../utils/logger";
 import MAIN_LOGGER from "@whiskeysockets/baileys/lib/Utils/logger";
-import authState from "./authState";
+import authState from "../helpers/authState";
 import { Boom } from "@hapi/boom";
 import AppError from "../errors/AppError";
 import { getIO } from "./socket";
@@ -22,6 +22,7 @@ import { Store } from "./store";
 import { StartWhatsAppSession } from "../services/WbotServices/StartWhatsAppSession";
 import DeleteBaileysService from "../services/BaileysServices/DeleteBaileysService";
 import NodeCache from "node-cache";
+import authState from "../helpers/authState";
 
 const loggerBaileys = MAIN_LOGGER.child({});
 loggerBaileys.level = "error";
