@@ -111,14 +111,35 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
 
         try {
           if (state?.creds) {
-            ensureBuffers(state.creds);
+            // deeper, safer coercion to Buffer for anything that looks like byte array
+            const coerceToBufferDeep = (v: any): any => {
+              if (v == null) return v;
+              // if it's already a Buffer or typed array
+              if (Buffer.isBuffer(v) || v instanceof Uint8Array) return Buffer.from(v);
+              // { type: 'Buffer', data: 'base64' }
+              if (v && typeof v === "object" && v.type === "Buffer" && typeof v.data === "string") {
+                try { return Buffer.from(v.data, "base64"); } catch { return v; }
+              }
+              // arrays of numbers
+              if (Array.isArray(v) && v.every((x) => typeof x === "number")) return Buffer.from(v);
+              if (typeof v === "object") {
+                for (const k of Object.keys(v)) v[k] = coerceToBufferDeep(v[k]);
+              }
+              return v;
+            };
+
+            state.creds = coerceToBufferDeep(state.creds);
+            state.keys = coerceToBufferDeep(state.keys);
+
             if (process.env.DEBUG_AUTH === "true") {
               /* eslint-disable no-console */
-              console.info("[auth debug] creds sample:", {
-                noiseKeyPrivate: typeof state.creds.noiseKey?.private,
-                noiseKeyPublic: typeof state.creds.noiseKey?.public,
-                signedIdentityKeyPrivate: typeof state.creds.signedIdentityKey?.private
-              });
+              const sample = {
+                noiseKeyPrivateIsBuffer: Buffer.isBuffer(state.creds?.noiseKey?.private),
+                noiseKeyPublicIsBuffer: Buffer.isBuffer(state.creds?.noiseKey?.public),
+                signedIdentityKeyPrivateIsBuffer: Buffer.isBuffer(state.creds?.signedIdentityKey?.private),
+                signedPreKeySignatureIsBuffer: Buffer.isBuffer(state.creds?.signedPreKey?.signature)
+              };
+              console.info("[auth debug] creds diagnostics:", sample);
             }
           }
         } catch (e) {
