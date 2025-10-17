@@ -10,6 +10,7 @@ import makeWASocket, {
   isJidBroadcast,
   CacheStore
 } from "@whiskeysockets/baileys";
+
 import makeWALegacySocket from "@whiskeysockets/baileys";
 import P from "pino";
 
@@ -27,6 +28,10 @@ import NodeCache from 'node-cache';
 
 const loggerBaileys = MAIN_LOGGER.child({});
 loggerBaileys.level = "error";
+
+type StartOpts = {
+  whatsapp: Whatsapp // registro da sua tabela (com campos: id/name/session etc.)
+}
 
 type Session = WASocket & {
   id?: number;
@@ -93,9 +98,9 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
         const store = (typeof (baileysMakeInMemoryStore as any) === "function")
           ? (baileysMakeInMemoryStore as any)({ logger: loggerBaileys })
           : {
-              // minimal fallback store used only to keep code paths that call `store.bind(ev)` safe
-              bind: (_ev: any) => { /* no-op fallback */ },
-            } as any;
+            // minimal fallback store used only to keep code paths that call `store.bind(ev)` safe
+            bind: (_ev: any) => { /* no-op fallback */ },
+          } as any;
 
         const { state, saveState } = await authState(whatsapp);
 
@@ -266,4 +271,54 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
       reject(error);
     }
   });
+};
+
+
+export async function startWbot({ whatsapp }: StartOpts) {
+  const logger = pino({ level: "info" })
+  const { version, isLatest } = await fetchLatestBaileysVersion()
+  logger.info({ version, isLatest }, "Using WA version")
+
+  const { state, saveState } = await authState(whatsapp)
+
+  const sock = makeWASocket({
+    version,
+    logger,
+    browser: Browsers("Atendechat", "Chrome", "1.0.0"),
+    printQRInTerminal: false, // você deve expor o QR via API/socket da sua app
+    auth: state,
+    // conexão
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    emitOwnEvents: false,
+    defaultQueryTimeoutMs: 60_000
+  })
+
+  // persistir creds
+  sock.ev.on("creds.update", saveState)
+
+  // logs úteis
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update
+    if (qr) {
+      logger.info("QR code gerado (envie para o front a partir daqui)")
+      // aqui você pode salvar o QR num cache/redis e expor pro front
+    }
+    if (connection === "close") {
+      const code = (lastDisconnect?.error as any)?.output?.statusCode || (lastDisconnect?.error as any)?.code
+      logger.error({ code, err: lastDisconnect?.error }, "Conexão fechada")
+      if (code === DisconnectReason.loggedOut) {
+        // sessão inválida — limpe a sessão no DB se quiser forçar novo QR
+        void whatsapp.update({ session: null })
+      }
+    }
+    if (connection === "open") {
+      logger.info("Conectado ao WhatsApp ✅")
+    }
+  })
+
+  // exemplo: tratar mensagens (opcional)
+  // sock.ev.on("messages.upsert", ({ messages }) => { ... })
+
+  return sock
 };
