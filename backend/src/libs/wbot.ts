@@ -83,6 +83,48 @@ export const initWASocket = async (whatsapp: Whatsapp): Promise<Session> => {
 
         const { state, saveState } = await authState(whatsapp);
 
+        // Defensive normalization: ensure creds binary fields are Buffer/Uint8Array
+        const ensureBuffers = (obj: any) => {
+          if (!obj || typeof obj !== "object") return obj;
+          // convert { type: 'Buffer', data: 'base64' } shapes
+          if (obj.type === "Buffer" && typeof obj.data === "string") {
+            try {
+              return Buffer.from(obj.data, "base64");
+            } catch (e) {
+              return obj;
+            }
+          }
+          // arrays of numbers -> Uint8Array
+          if (Array.isArray(obj) && obj.every((x) => typeof x === "number")) {
+            return Uint8Array.from(obj);
+          }
+
+          for (const k of Object.keys(obj)) {
+            try {
+              obj[k] = ensureBuffers(obj[k]);
+            } catch (_e) {
+              // ignore
+            }
+          }
+          return obj;
+        };
+
+        try {
+          if (state?.creds) {
+            ensureBuffers(state.creds);
+            if (process.env.DEBUG_AUTH === "true") {
+              /* eslint-disable no-console */
+              console.info("[auth debug] creds sample:", {
+                noiseKeyPrivate: typeof state.creds.noiseKey?.private,
+                noiseKeyPublic: typeof state.creds.noiseKey?.public,
+                signedIdentityKeyPrivate: typeof state.creds.signedIdentityKey?.private
+              });
+            }
+          }
+        } catch (e) {
+          logger.error(e);
+        }
+
         const msgRetryCounterCache = new NodeCache();
         const userDevicesCache: CacheStore = new NodeCache();
 
